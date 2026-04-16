@@ -211,6 +211,10 @@ pub mod crypto;
 #[doc(hidden)]
 pub mod dynamic_assertion;
 
+/// Collaborative provenance helpers layered on top of the existing C2PA API.
+#[cfg(feature = "openssl")]
+pub mod collaborative;
+
 /// The `http` module contains generic traits for configuring sync and async HTTP resolvers.
 pub mod http;
 
@@ -245,6 +249,9 @@ pub use assertions::Relationship;
 pub use builder::{Builder, BuilderIntent, HashType, ManifestDefinition};
 pub use callback_signer::{CallbackFunc, CallbackSigner};
 pub use claim_generator_info::ClaimGeneratorInfo;
+#[cfg(feature = "openssl")]
+#[doc(inline)]
+pub use collaborative::*;
 #[doc(inline)]
 pub use context::{Context, ProgressCallbackFunc, ProgressPhase};
 pub use crypto::raw_signature::SigningAlg;

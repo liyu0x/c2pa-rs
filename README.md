@@ -1,5 +1,45 @@
 # C2PA Rust library
 
+## Collaborative provenance fork
+
+This fork keeps the original `c2pa` API intact. Collaborative provenance is added
+as an internal extension of the existing manifest flow.
+
+### Usage
+
+Generate with the usual `Builder` flow and attach the collaborative payload as a
+normal assertion before signing:
+
+```rust
+use c2pa::{Builder, Context};
+
+let context = Context::new().with_settings(include_str!("settings.toml"))?;
+let mut builder = Builder::from_context(context).with_definition(serde_json::json!({
+    "title": "Collaborative Asset"
+}))?;
+
+builder.add_assertion_json(
+    "org.contentauth.collaborative.authorization",
+    &embedded_collaborative_manifest,
+)?;
+
+let signed_bytes = builder.sign_embeddable("image/jpeg")?;
+```
+
+Verify it with the existing `Reader` flow, then recover the collaborative
+authorization from the active manifest:
+
+```rust
+use c2pa::Reader;
+
+let reader = Reader::default().with_stream("image/jpeg", &mut asset_stream)?;
+let active = reader.active_manifest().expect("active manifest");
+let collaborative = active.find_assertion("org.contentauth.collaborative.authorization")?;
+```
+
+Standard C2PA parsing and certificate-chain verification still run first; the
+collaborative checks are applied after the manifest is loaded.
+
 [![Tier 1A](https://github.com/contentauth/c2pa-rs/actions/workflows/tier-1a.yml/badge.svg)](https://github.com/contentauth/c2pa-rs/actions/workflows/tier-1a.yml) [![Tier 1B](https://github.com/contentauth/c2pa-rs/actions/workflows/tier-1b.yml/badge.svg)](https://github.com/contentauth/c2pa-rs/actions/workflows/tier-1b.yml) [![Tier 2](https://github.com/contentauth/c2pa-rs/actions/workflows/tier-2.yml/badge.svg)](https://github.com/contentauth/c2pa-rs/actions/workflows/tier-2.yml) [![Latest Version](https://img.shields.io/crates/v/c2pa.svg)](https://crates.io/crates/c2pa) [![docs.rs](https://img.shields.io/docsrs/c2pa)](https://docs.rs/c2pa/) [![codecov](https://codecov.io/gh/contentauth/c2pa-rs/branch/main/graph/badge.svg?token=YVHWI19EGN)](https://codecov.io/gh/contentauth/c2pa-rs)
 
 For information on support tiers for CI tests, see [Support tiers for C2PA Rust SDK products](https://github.com/contentauth/c2pa-rs/blob/main/docs/support-tiers.md)
@@ -44,8 +84,11 @@ The library enables a desktop, mobile, or embedded application to:
 * Embed manifests in [supported file formats](docs/supported-formats.md).
 * Parse and validate manifests found in [supported file formats](docs/supported-formats.md).
 * Share configuration efficiently across multiple operations and threads through contexts using `Arc<Context>`.
+* Layer collaborative authorization on top of the existing manifest flow while keeping the public API centered on the original `Builder` and `Reader` entry points.
 
 The library supports several common C2PA [assertions](https://c2pa.org/specifications/specifications/2.2/specs/C2PA_Specification.html#_c2pa_standard_assertions) and [hard bindings](https://c2pa.org/specifications/specifications/2.2/specs/C2PA_Specification.html#_hard_bindings).
+
+The fork keeps the standard `c2pa` API intact. Collaborative provenance support is implemented as an internal extension of the existing manifest flow, so generation and verification still go through the original `Builder` and `Reader` APIs.
 
 For details on what you can do with the library, see [Using the Rust library](https://opensource.contentauthenticity.org/docs/rust-sdk/docs/usage).
 
