@@ -14,7 +14,9 @@ use std::{collections::BTreeSet, fs, path::Path};
 
 use openssl::{
     asn1::Asn1Time,
+    hash::MessageDigest,
     pkey::Id,
+    sign::Verifier,
     x509::{store::X509StoreBuilder, verify::X509VerifyFlags, X509StoreContext, X509},
 };
 use serde::{Deserialize, Serialize};
@@ -221,6 +223,104 @@ pub fn encode_roster(roster: &[Participant]) -> Result<Vec<u8>, Error> {
         append_len_prefixed(&mut encoded, &encode_participant(&participant));
     }
     Ok(encoded)
+}
+
+/// Build the enrollment challenge that a participant must sign to prove
+/// possession of the private key corresponding to its advertised public key.
+pub fn build_enrollment_challenge(
+    participant_id: &str,
+    public_key_der: &[u8],
+    nonce: &[u8],
+) -> Vec<u8> {
+    let mut challenge = Vec::new();
+    append_len_prefixed(&mut challenge, b"C2PA-COLLAB-POP-V1");
+    append_len_prefixed(&mut challenge, participant_id.as_bytes());
+    append_len_prefixed(&mut challenge, public_key_der);
+    append_len_prefixed(&mut challenge, nonce);
+    challenge
+}
+
+fn challenge_prefix(participant_id: &str, public_key_der: &[u8]) -> Vec<u8> {
+    let mut prefix = Vec::new();
+    append_len_prefixed(&mut prefix, b"C2PA-COLLAB-POP-V1");
+    append_len_prefixed(&mut prefix, participant_id.as_bytes());
+    append_len_prefixed(&mut prefix, public_key_der);
+    prefix
+}
+
+/// Validate a single enrollment package and its proof of possession.
+pub fn validate_enrollment_package(package: &EnrollmentPackage) -> Result<(), Error> {
+    if package.participant.identifier != package.proof_of_possession.participant_id {
+        return Err(io_error(
+            std::io::ErrorKind::InvalidInput,
+            "participant identifier does not match proof-of-possession package",
+        ));
+    }
+
+    let public_key = openssl::pkey::PKey::public_key_from_der(&package.participant.public_key_der)
+        .map_err(other_error)?;
+    let mut verifier =
+        Verifier::new(MessageDigest::sha256(), &public_key).map_err(other_error)?;
+    verifier
+        .update(&package.proof_of_possession.challenge)
+        .map_err(other_error)?;
+    let verified = verifier
+        .verify(&package.proof_of_possession.signature)
+        .map_err(other_error)?;
+    if !verified {
+        return Err(io_error(
+            std::io::ErrorKind::PermissionDenied,
+            "proof-of-possession signature verification failed",
+        ));
+    }
+
+    let prefix = challenge_prefix(
+        &package.participant.identifier,
+        &package.participant.public_key_der,
+    );
+    let challenge = &package.proof_of_possession.challenge;
+    if !challenge.starts_with(&prefix) {
+        return Err(io_error(
+            std::io::ErrorKind::InvalidInput,
+            "proof-of-possession challenge is not bound to the participant identity and public key",
+        ));
+    }
+    if challenge.len() <= prefix.len() + 4 {
+        return Err(io_error(
+            std::io::ErrorKind::InvalidInput,
+            "proof-of-possession challenge is missing nonce material",
+        ));
+    }
+
+    Ok(())
+}
+
+/// Validate a roster of enrollment packages and return the certified participants.
+pub fn validate_enrollment_packages(
+    packages: &[EnrollmentPackage],
+) -> Result<Vec<Participant>, Error> {
+    if packages.is_empty() {
+        return Err(io_error(
+            std::io::ErrorKind::InvalidInput,
+            "no enrollment packages supplied",
+        ));
+    }
+
+    let mut participants = Vec::with_capacity(packages.len());
+    for package in packages {
+        validate_enrollment_package(package)?;
+        participants.push(package.participant.clone());
+    }
+    canonicalize_roster(&participants)
+}
+
+/// Build a certificate profile only after the enrollment packages have passed PoP validation.
+pub fn build_aggregate_certificate_profile_from_enrollments(
+    aggregate_public_key: AggregatePublicKey,
+    packages: &[EnrollmentPackage],
+) -> Result<AggregateCertificateProfile, Error> {
+    let participants = validate_enrollment_packages(packages)?;
+    build_aggregate_certificate_profile(aggregate_public_key, &participants)
 }
 
 /// Compute the roster commitment used to bind a certificate to one final approver set.
@@ -945,6 +1045,7 @@ mod tests {
         hash::MessageDigest,
         pkey::PKey,
         rsa::Rsa,
+        sign::Signer,
         x509::{
             extension::{BasicConstraints, KeyUsage},
             X509Extension, X509NameBuilder, X509,
@@ -1120,6 +1221,29 @@ mod tests {
         assert!(TrustStore::from_pem("not a certificate").is_err());
     }
 
+    #[test]
+    fn enrollment_package_requires_valid_proof_of_possession() -> Result<()> {
+        let (_, package) = make_enrollment_package("alice", b"nonce-alice")?;
+        validate_enrollment_package(&package)?;
+
+        let signer = DummySigner;
+        let profile = build_aggregate_certificate_profile_from_enrollments(
+            signer.aggregate_public_key(std::slice::from_ref(&package.participant))?,
+            std::slice::from_ref(&package),
+        )?;
+        assert_eq!(profile.participants_references, vec!["fp-alice"]);
+        Ok(())
+    }
+
+    #[test]
+    fn enrollment_package_rejects_challenge_not_bound_to_public_key() -> Result<()> {
+        let (_, mut package) = make_enrollment_package("alice", b"nonce-alice")?;
+        package.proof_of_possession.challenge =
+            build_enrollment_challenge("alice", b"wrong-public-key", b"nonce-alice");
+        assert!(validate_enrollment_package(&package).is_err());
+        Ok(())
+    }
+
     fn simple_manifest_json() -> String {
         json!({
             "claim_generator_info": [
@@ -1170,6 +1294,37 @@ mod tests {
     fn pem_string(cert: &X509) -> Result<String> {
         String::from_utf8(cert.to_pem().map_err(other_error)?)
             .map_err(|err| io_error(std::io::ErrorKind::InvalidData, err.to_string()))
+    }
+
+    fn make_enrollment_package(
+        participant_id: &str,
+        nonce: &[u8],
+    ) -> Result<(PKey<openssl::pkey::Private>, EnrollmentPackage)> {
+        let private_key =
+            PKey::from_rsa(Rsa::generate(2048).map_err(other_error)?).map_err(other_error)?;
+        let public_key_der = private_key.public_key_to_der().map_err(other_error)?;
+        let participant = Participant {
+            identifier: participant_id.to_string(),
+            certificate_fingerprint: format!("fp-{participant_id}"),
+            public_key_der: public_key_der.clone(),
+        };
+        let challenge = build_enrollment_challenge(participant_id, &public_key_der, nonce);
+        let mut signer =
+            Signer::new(MessageDigest::sha256(), &private_key).map_err(other_error)?;
+        signer.update(&challenge).map_err(other_error)?;
+        let signature = signer.sign_to_vec().map_err(other_error)?;
+
+        Ok((
+            private_key,
+            EnrollmentPackage {
+                participant,
+                proof_of_possession: ProofOfPossession {
+                    participant_id: participant_id.to_string(),
+                    challenge,
+                    signature,
+                },
+            },
+        ))
     }
 
     fn issue_test_collaborative_certificate(
@@ -1460,23 +1615,11 @@ mod tests {
     #[test]
     fn collaborative_manifest_round_trip_and_verify() -> Result<()> {
         let signer = DummySigner;
-        let roster = vec![
-            Participant {
-                identifier: "alice".to_string(),
-                certificate_fingerprint: "fp-alice".to_string(),
-                public_key_der: vec![1, 1, 1],
-            },
-            Participant {
-                identifier: "bob".to_string(),
-                certificate_fingerprint: "fp-bob".to_string(),
-                public_key_der: vec![2, 2, 2],
-            },
-            Participant {
-                identifier: "carol".to_string(),
-                certificate_fingerprint: "fp-carol".to_string(),
-                public_key_der: vec![3, 3, 3],
-            },
-        ];
+        let (_, alice) = make_enrollment_package("alice", b"nonce-alice")?;
+        let (_, bob) = make_enrollment_package("bob", b"nonce-bob")?;
+        let (_, carol) = make_enrollment_package("carol", b"nonce-carol")?;
+        let enrollments = vec![alice, bob, carol];
+        let roster = validate_enrollment_packages(&enrollments)?;
 
         let claim_digest = ClaimDigest(Sha256::digest(b"collaborative claim digest").to_vec());
         let partials = roster
@@ -1486,8 +1629,10 @@ mod tests {
         let aggregate_signature =
             signer.aggregate_signatures(&claim_digest, &roster, &partials)?;
         let aggregate_public_key = signer.aggregate_public_key(&roster)?;
-        let profile =
-            build_aggregate_certificate_profile(aggregate_public_key.clone(), &roster)?;
+        let profile = build_aggregate_certificate_profile_from_enrollments(
+            aggregate_public_key.clone(),
+            &enrollments,
+        )?;
         let (issued_certificate, root_pem) = issue_test_collaborative_certificate(&profile)?;
         let root_pem_for_trust = root_pem.clone();
         let root_pem_for_route = root_pem.clone();
@@ -1566,6 +1711,105 @@ mod tests {
         // recovered directly as well.
         let recovered = extract_certificate_profile(&embedded.aggregate_certificate)?;
         assert_eq!(recovered, profile);
+
+        Ok(())
+    }
+
+    #[test]
+    fn collaborative_manifest_round_trip_and_verify_five_participants() -> Result<()> {
+        let signer = DummySigner;
+        let (_, alice) = make_enrollment_package("alice", b"nonce-alice")?;
+        let (_, bob) = make_enrollment_package("bob", b"nonce-bob")?;
+        let (_, carol) = make_enrollment_package("carol", b"nonce-carol")?;
+        let (_, dave) = make_enrollment_package("dave", b"nonce-dave")?;
+        let (_, eve) = make_enrollment_package("eve", b"nonce-eve")?;
+        let enrollments = vec![alice, bob, carol, dave, eve];
+        let roster = validate_enrollment_packages(&enrollments)?;
+
+        let claim_digest = ClaimDigest(Sha256::digest(b"collaborative claim digest five").to_vec());
+        let partials = roster
+            .iter()
+            .map(|participant| signer.partial_sign(participant, &claim_digest))
+            .collect::<Result<Vec<_>>>()?;
+        let aggregate_signature =
+            signer.aggregate_signatures(&claim_digest, &roster, &partials)?;
+        let aggregate_public_key = signer.aggregate_public_key(&roster)?;
+        let profile = build_aggregate_certificate_profile_from_enrollments(
+            aggregate_public_key.clone(),
+            &enrollments,
+        )?;
+        let (issued_certificate, root_pem) = issue_test_collaborative_certificate(&profile)?;
+        let root_pem_for_trust = root_pem.clone();
+        let root_pem_for_route = root_pem.clone();
+        let authorization = AuthorizationPackage {
+            claim_digest: claim_digest.clone(),
+            aggregate_signature: aggregate_signature.clone(),
+            aggregate_certificate_hash: hex::encode(Sha256::digest(
+                serde_json::to_vec(&issued_certificate).map_err(other_error)?,
+            )),
+        };
+        let embedded = EmbeddedCollaborativeManifest {
+            authorization,
+            aggregate_certificate: issued_certificate,
+        };
+
+        let source = include_bytes!("../tests/fixtures/IMG_0003.jpg");
+        let mut source_stream = std::io::Cursor::new(source.as_slice());
+        let mut output_stream = std::io::Cursor::new(Vec::<u8>::new());
+
+        let context =
+            Context::new().with_signer(test_signer(crate::crypto::raw_signature::SigningAlg::Ps256));
+        let mut builder = Builder::from_context(context).with_definition(simple_manifest_json())?;
+        builder.add_assertion_json(COLLABORATIVE_AUTHORIZATION_LABEL, &embedded)?;
+        let placeholder = builder.placeholder("image/jpeg")?;
+        let offset = write_jpeg_placeholder_stream(
+            &placeholder,
+            "image/jpeg",
+            &mut source_stream,
+            &mut output_stream,
+            None,
+        )?;
+        output_stream.set_position(0);
+        builder.update_hash_from_stream("image/jpeg", &mut output_stream)?;
+        let signed_manifest = builder.sign_embeddable("image/jpeg")?;
+
+        let mut patched_stream = std::io::Cursor::new(Vec::new());
+        patch_stream(
+            &mut output_stream,
+            &mut patched_stream,
+            offset as u64,
+            placeholder.len() as u64,
+            &signed_manifest,
+        )
+        .map_err(other_error)?;
+
+        patched_stream.set_position(0);
+        let reader = Reader::default()
+            .with_stream("image/jpeg", &mut patched_stream)?;
+        let extracted = reader
+            .active_manifest()
+            .expect("active manifest should be present")
+            .find_assertion(COLLABORATIVE_AUTHORIZATION_LABEL)?;
+
+        let verifier = CollaborativeVerifier::with_trust_store(
+            signer,
+            TrustStore::from_pem(root_pem_for_trust)?,
+        );
+        let summary = verifier.verify_embedded(&extracted, &roster)?;
+        assert!(summary.verified);
+        assert_eq!(
+            summary.approver_ids,
+            vec!["alice", "bob", "carol", "dave", "eve"]
+        );
+
+        let route = verify_issued_certificate_by_route(
+            &signer,
+            &embedded.aggregate_certificate,
+            &roster,
+            &[root_pem_for_route],
+            true,
+        )?;
+        assert_eq!(route, CertificateVerificationRoute::Collaborative);
 
         Ok(())
     }
