@@ -259,8 +259,7 @@ pub fn validate_enrollment_package(package: &EnrollmentPackage) -> Result<(), Er
 
     let public_key = openssl::pkey::PKey::public_key_from_der(&package.participant.public_key_der)
         .map_err(other_error)?;
-    let mut verifier =
-        Verifier::new(MessageDigest::sha256(), &public_key).map_err(other_error)?;
+    let mut verifier = Verifier::new(MessageDigest::sha256(), &public_key).map_err(other_error)?;
     verifier
         .update(&package.proof_of_possession.challenge)
         .map_err(other_error)?;
@@ -1054,7 +1053,9 @@ mod tests {
     use serde_json::json;
 
     use crate::{
-        utils::{io_utils::patch_stream, test::write_jpeg_placeholder_stream, test_signer::test_signer},
+        utils::{
+            io_utils::patch_stream, test::write_jpeg_placeholder_stream, test_signer::test_signer,
+        },
         Builder, Context, Reader,
     };
 
@@ -1309,8 +1310,7 @@ mod tests {
             public_key_der: public_key_der.clone(),
         };
         let challenge = build_enrollment_challenge(participant_id, &public_key_der, nonce);
-        let mut signer =
-            Signer::new(MessageDigest::sha256(), &private_key).map_err(other_error)?;
+        let mut signer = Signer::new(MessageDigest::sha256(), &private_key).map_err(other_error)?;
         signer.update(&challenge).map_err(other_error)?;
         let signature = signer.sign_to_vec().map_err(other_error)?;
 
@@ -1330,10 +1330,10 @@ mod tests {
     fn issue_test_collaborative_certificate(
         profile: &AggregateCertificateProfile,
     ) -> Result<(IssuedAggregateCertificate, String)> {
-        let root_key = PKey::from_rsa(Rsa::generate(2048).map_err(other_error)?)
-            .map_err(other_error)?;
-        let leaf_key = PKey::from_rsa(Rsa::generate(2048).map_err(other_error)?)
-            .map_err(other_error)?;
+        let root_key =
+            PKey::from_rsa(Rsa::generate(2048).map_err(other_error)?).map_err(other_error)?;
+        let leaf_key =
+            PKey::from_rsa(Rsa::generate(2048).map_err(other_error)?).map_err(other_error)?;
 
         let mut root_name = X509NameBuilder::new().map_err(other_error)?;
         root_name
@@ -1365,7 +1365,13 @@ mod tests {
             .set_not_after(&root_not_after)
             .map_err(other_error)?;
         root_builder
-            .append_extension(BasicConstraints::new().critical().ca().build().map_err(other_error)?)
+            .append_extension(
+                BasicConstraints::new()
+                    .critical()
+                    .ca()
+                    .build()
+                    .map_err(other_error)?,
+            )
             .map_err(other_error)?;
         root_builder
             .append_extension(
@@ -1414,42 +1420,34 @@ mod tests {
 
         // Encode the profile directly into X.509 custom extensions so the verifier
         // exercises the same bridge design the paper describes.
-        let roster_hash_oid = Asn1Object::from_str(ALLOWED_CUSTOM_EXTENSION_OIDS[0])
-            .map_err(other_error)?;
-        let roster_hash_value = Asn1OctetString::new_from_bytes(&der_utf8_string(
-            &profile.participants_roster_hash,
-        ))
-        .map_err(other_error)?;
-        let roster_hash_ext = X509Extension::new_from_der(
-            &roster_hash_oid,
-            false,
-            &roster_hash_value,
-        )
-        .map_err(other_error)?;
+        let roster_hash_oid =
+            Asn1Object::from_str(ALLOWED_CUSTOM_EXTENSION_OIDS[0]).map_err(other_error)?;
+        let roster_hash_value =
+            Asn1OctetString::new_from_bytes(&der_utf8_string(&profile.participants_roster_hash))
+                .map_err(other_error)?;
+        let roster_hash_ext =
+            X509Extension::new_from_der(&roster_hash_oid, false, &roster_hash_value)
+                .map_err(other_error)?;
         leaf_builder
             .append_extension(roster_hash_ext)
             .map_err(other_error)?;
 
         let participant_refs_json =
             serde_json::to_string(&profile.participants_references).map_err(other_error)?;
-        let participant_refs_oid = Asn1Object::from_str(ALLOWED_CUSTOM_EXTENSION_OIDS[1])
-            .map_err(other_error)?;
-        let participant_refs_value = Asn1OctetString::new_from_bytes(&der_utf8_string(
-            &participant_refs_json,
-        ))
-        .map_err(other_error)?;
-        let participant_refs_ext = X509Extension::new_from_der(
-            &participant_refs_oid,
-            false,
-            &participant_refs_value,
-        )
-        .map_err(other_error)?;
+        let participant_refs_oid =
+            Asn1Object::from_str(ALLOWED_CUSTOM_EXTENSION_OIDS[1]).map_err(other_error)?;
+        let participant_refs_value =
+            Asn1OctetString::new_from_bytes(&der_utf8_string(&participant_refs_json))
+                .map_err(other_error)?;
+        let participant_refs_ext =
+            X509Extension::new_from_der(&participant_refs_oid, false, &participant_refs_value)
+                .map_err(other_error)?;
         leaf_builder
             .append_extension(participant_refs_ext)
             .map_err(other_error)?;
 
-        let aggregate_algorithm_oid = Asn1Object::from_str(ALLOWED_CUSTOM_EXTENSION_OIDS[2])
-            .map_err(other_error)?;
+        let aggregate_algorithm_oid =
+            Asn1Object::from_str(ALLOWED_CUSTOM_EXTENSION_OIDS[2]).map_err(other_error)?;
         let aggregate_algorithm_value = Asn1OctetString::new_from_bytes(&der_utf8_string(
             &profile.aggregate_public_key.algorithm,
         ))
@@ -1465,12 +1463,11 @@ mod tests {
             .map_err(other_error)?;
 
         let aggregate_public_key_hex = hex::encode(&profile.aggregate_public_key.bytes);
-        let aggregate_public_key_oid = Asn1Object::from_str(ALLOWED_CUSTOM_EXTENSION_OIDS[3])
-            .map_err(other_error)?;
-        let aggregate_public_key_value = Asn1OctetString::new_from_bytes(&der_utf8_string(
-            &aggregate_public_key_hex,
-        ))
-        .map_err(other_error)?;
+        let aggregate_public_key_oid =
+            Asn1Object::from_str(ALLOWED_CUSTOM_EXTENSION_OIDS[3]).map_err(other_error)?;
+        let aggregate_public_key_value =
+            Asn1OctetString::new_from_bytes(&der_utf8_string(&aggregate_public_key_hex))
+                .map_err(other_error)?;
         let aggregate_public_key_ext = X509Extension::new_from_der(
             &aggregate_public_key_oid,
             false,
@@ -1542,7 +1539,13 @@ mod tests {
             .set_not_after(&root_not_after)
             .map_err(other_error)?;
         root_builder
-            .append_extension(BasicConstraints::new().critical().ca().build().map_err(other_error)?)
+            .append_extension(
+                BasicConstraints::new()
+                    .critical()
+                    .ca()
+                    .build()
+                    .map_err(other_error)?,
+            )
             .map_err(other_error)?;
         root_builder
             .append_extension(
@@ -1626,8 +1629,7 @@ mod tests {
             .iter()
             .map(|participant| signer.partial_sign(participant, &claim_digest))
             .collect::<Result<Vec<_>>>()?;
-        let aggregate_signature =
-            signer.aggregate_signatures(&claim_digest, &roster, &partials)?;
+        let aggregate_signature = signer.aggregate_signatures(&claim_digest, &roster, &partials)?;
         let aggregate_public_key = signer.aggregate_public_key(&roster)?;
         let profile = build_aggregate_certificate_profile_from_enrollments(
             aggregate_public_key.clone(),
@@ -1652,8 +1654,8 @@ mod tests {
         let mut source_stream = std::io::Cursor::new(source.as_slice());
         let mut output_stream = std::io::Cursor::new(Vec::<u8>::new());
 
-        let context =
-            Context::new().with_signer(test_signer(crate::crypto::raw_signature::SigningAlg::Ps256));
+        let context = Context::new()
+            .with_signer(test_signer(crate::crypto::raw_signature::SigningAlg::Ps256));
         let mut builder = Builder::from_context(context).with_definition(simple_manifest_json())?;
         builder.add_assertion_json(COLLABORATIVE_AUTHORIZATION_LABEL, &embedded)?;
         let placeholder = builder.placeholder("image/jpeg")?;
@@ -1679,8 +1681,7 @@ mod tests {
         .map_err(other_error)?;
 
         patched_stream.set_position(0);
-        let reader = Reader::default()
-            .with_stream("image/jpeg", &mut patched_stream)?;
+        let reader = Reader::default().with_stream("image/jpeg", &mut patched_stream)?;
         assert!(reader.active_manifest().is_some());
 
         let extracted = reader
@@ -1731,8 +1732,7 @@ mod tests {
             .iter()
             .map(|participant| signer.partial_sign(participant, &claim_digest))
             .collect::<Result<Vec<_>>>()?;
-        let aggregate_signature =
-            signer.aggregate_signatures(&claim_digest, &roster, &partials)?;
+        let aggregate_signature = signer.aggregate_signatures(&claim_digest, &roster, &partials)?;
         let aggregate_public_key = signer.aggregate_public_key(&roster)?;
         let profile = build_aggregate_certificate_profile_from_enrollments(
             aggregate_public_key.clone(),
@@ -1757,8 +1757,8 @@ mod tests {
         let mut source_stream = std::io::Cursor::new(source.as_slice());
         let mut output_stream = std::io::Cursor::new(Vec::<u8>::new());
 
-        let context =
-            Context::new().with_signer(test_signer(crate::crypto::raw_signature::SigningAlg::Ps256));
+        let context = Context::new()
+            .with_signer(test_signer(crate::crypto::raw_signature::SigningAlg::Ps256));
         let mut builder = Builder::from_context(context).with_definition(simple_manifest_json())?;
         builder.add_assertion_json(COLLABORATIVE_AUTHORIZATION_LABEL, &embedded)?;
         let placeholder = builder.placeholder("image/jpeg")?;
@@ -1784,8 +1784,7 @@ mod tests {
         .map_err(other_error)?;
 
         patched_stream.set_position(0);
-        let reader = Reader::default()
-            .with_stream("image/jpeg", &mut patched_stream)?;
+        let reader = Reader::default().with_stream("image/jpeg", &mut patched_stream)?;
         let extracted = reader
             .active_manifest()
             .expect("active manifest should be present")
