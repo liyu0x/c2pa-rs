@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     env,
     fs::File,
     hint::black_box,
@@ -7,14 +8,15 @@ use std::{
     time::{Duration, Instant},
 };
 
+use blst::{min_pk as bls, BLST_ERROR};
 use c2pa::{
-    build_aggregate_certificate_profile_from_enrollments, build_enrollment_challenge,
-    canonicalize_roster, encode_roster, AggregateCertificateProfile, AggregatePublicKey,
-    AggregateSignature, AuthorizationPackage, Builder, CallbackSigner, ClaimDigest,
-    CollaborativeVerifier, CollectiveSigner, EmbeddedCollaborativeManifest, EnrollmentPackage,
-    Error, IssuedAggregateCertificate, PartialSignature, Participant, ProofOfPossession, Reader,
-    Result, SigningAlg, TrustStore, ALLOWED_CUSTOM_EXTENSION_OIDS,
-    COLLABORATIVE_AUTHORIZATION_LABEL,
+    build_aggregate_certificate_profile, build_receipt_bound_export_context_digest,
+    canonicalize_roster, export_content_hash_from_stream, issue_platform_acceptance_receipt,
+    AggregateCertificateProfile, AggregatePublicKey, AggregateSignature, AuthorizationPackage,
+    Builder, CallbackSigner, CollaborativeVerifier, CollectiveSigner,
+    EmbeddedCollaborativeManifest, Error, ExportContextDigest, IssuedAggregateCertificate,
+    IssuedPlatformReceiptCertificate, PartialSignature, Participant, Reader, Result, SigningAlg,
+    TrustStore, ALLOWED_CUSTOM_EXTENSION_OIDS, COLLABORATIVE_AUTHORIZATION_LABEL,
 };
 use openssl::{
     asn1::{Asn1Object, Asn1OctetString, Asn1Time},
@@ -22,12 +24,12 @@ use openssl::{
     hash::MessageDigest,
     pkey::{PKey, Private},
     rsa::Rsa,
-    sign::Signer as OpenSslSigner,
     x509::{
         extension::{BasicConstraints, KeyUsage},
         X509Extension, X509NameBuilder, X509,
     },
 };
+use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
 
 const CERTS: &[u8] = include_bytes!("../tests/fixtures/certs/ed25519.pub");
@@ -35,44 +37,68 @@ const PRIVATE_KEY: &[u8] = include_bytes!("../tests/fixtures/certs/ed25519.pem")
 const SOURCE_JPEG: &[u8] = include_bytes!("../tests/fixtures/IMG_0003.jpg");
 const MANIFEST_JSON: &str = include_str!("../tests/fixtures/simple_manifest.json");
 const PARTICIPANT_COUNTS: &[usize] = &[20, 50, 100];
+const BLS_ALGORITHM: &str = "BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
+const BLS_SIGNATURE_DST: &[u8] = BLS_ALGORITHM.as_bytes();
+const BLS_POP_DST: &[u8] = b"BLS_POP_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 
-#[derive(Clone, Copy)]
-struct DemoCollectiveSigner;
+#[derive(Clone)]
+struct BlsCollectiveSigner {
+    secret_keys: BTreeMap<String, Vec<u8>>,
+}
 
-impl CollectiveSigner for DemoCollectiveSigner {
+impl CollectiveSigner for BlsCollectiveSigner {
     fn algorithm(&self) -> &'static str {
-        "demo-bdn-placeholder"
+        BLS_ALGORITHM
     }
 
     fn aggregate_public_key(&self, roster: &[Participant]) -> Result<AggregatePublicKey> {
+        let canonical = canonicalize_roster(roster)?;
+        let public_keys = canonical
+            .iter()
+            .map(|participant| {
+                bls::PublicKey::from_bytes(&participant.public_key_der).map_err(bls_error)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let public_key_refs = public_keys.iter().collect::<Vec<_>>();
+        let aggregate = bls::AggregatePublicKey::aggregate(&public_key_refs, true)
+            .map_err(bls_error)?
+            .to_public_key();
         Ok(AggregatePublicKey {
             algorithm: self.algorithm().to_owned(),
-            bytes: Sha256::digest(encode_roster(roster)?).to_vec(),
+            bytes: aggregate.to_bytes().to_vec(),
         })
     }
 
     fn partial_sign(
         &self,
         participant: &Participant,
-        claim_digest: &ClaimDigest,
+        export_context_digest: &ExportContextDigest,
     ) -> Result<PartialSignature> {
+        let secret_key_bytes = self
+            .secret_keys
+            .get(&participant.identifier)
+            .ok_or_else(|| {
+                io_error(
+                    std::io::ErrorKind::PermissionDenied,
+                    "missing BLS secret key for participant",
+                )
+            })?;
+        let secret_key = bls::SecretKey::from_bytes(secret_key_bytes).map_err(bls_error)?;
+        let signature = secret_key.sign(&export_context_digest.0, BLS_SIGNATURE_DST, &[]);
         Ok(PartialSignature {
             participant_id: participant.identifier.clone(),
-            bytes: Sha256::digest(
-                [participant.public_key_der.as_slice(), &claim_digest.0].concat(),
-            )
-            .to_vec(),
+            bytes: signature.to_bytes().to_vec(),
         })
     }
 
     fn aggregate_signatures(
         &self,
-        claim_digest: &ClaimDigest,
+        _export_context_digest: &ExportContextDigest,
         roster: &[Participant],
         partials: &[PartialSignature],
     ) -> Result<AggregateSignature> {
         let canonical = canonicalize_roster(roster)?;
-        let mut material = claim_digest.0.clone();
+        let mut signatures = Vec::with_capacity(canonical.len());
         for participant in canonical {
             let partial = partials
                 .iter()
@@ -83,17 +109,21 @@ impl CollectiveSigner for DemoCollectiveSigner {
                         "missing partial signature",
                     )
                 })?;
-            material.extend_from_slice(&partial.bytes);
+            signatures.push(bls::Signature::from_bytes(&partial.bytes).map_err(bls_error)?);
         }
+        let signature_refs = signatures.iter().collect::<Vec<_>>();
+        let aggregate = bls::AggregateSignature::aggregate(&signature_refs, true)
+            .map_err(bls_error)?
+            .to_signature();
         Ok(AggregateSignature {
             algorithm: self.algorithm().to_owned(),
-            bytes: Sha256::digest(material).to_vec(),
+            bytes: aggregate.to_bytes().to_vec(),
         })
     }
 
     fn verify(
         &self,
-        claim_digest: &ClaimDigest,
+        export_context_digest: &ExportContextDigest,
         aggregate_public_key: &AggregatePublicKey,
         signature: &AggregateSignature,
         roster: &[Participant],
@@ -105,15 +135,32 @@ impl CollectiveSigner for DemoCollectiveSigner {
                 "aggregate public key mismatch",
             ));
         }
-        let partials = roster
-            .iter()
-            .map(|participant| self.partial_sign(participant, claim_digest))
-            .collect::<Result<Vec<_>>>()?;
-        let expected_signature = self.aggregate_signatures(claim_digest, roster, &partials)?;
-        if expected_signature != *signature {
+        if signature.algorithm != self.algorithm() {
             return Err(io_error(
                 std::io::ErrorKind::InvalidData,
-                "aggregate signature verification failed",
+                "unexpected aggregate signature algorithm",
+            ));
+        }
+        let canonical = canonicalize_roster(roster)?;
+        let public_keys = canonical
+            .iter()
+            .map(|participant| {
+                bls::PublicKey::from_bytes(&participant.public_key_der).map_err(bls_error)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let public_key_refs = public_keys.iter().collect::<Vec<_>>();
+        let aggregate_signature =
+            bls::Signature::from_bytes(&signature.bytes).map_err(bls_error)?;
+        if aggregate_signature.fast_aggregate_verify(
+            true,
+            &export_context_digest.0,
+            BLS_SIGNATURE_DST,
+            &public_key_refs,
+        ) != BLST_ERROR::BLST_SUCCESS
+        {
+            return Err(io_error(
+                std::io::ErrorKind::InvalidData,
+                "BLS aggregate signature verification failed",
             ));
         }
         Ok(())
@@ -123,13 +170,22 @@ impl CollectiveSigner for DemoCollectiveSigner {
 #[derive(Clone)]
 struct PreparedEnrollment {
     roster: Vec<Participant>,
+    collective_signer: BlsCollectiveSigner,
     issued_certificate: IssuedAggregateCertificate,
+    platform_private_key_pem: Vec<u8>,
+    platform_receipt_certificate: IssuedPlatformReceiptCertificate,
     root_pem: String,
 }
 
 struct BenchmarkFixture {
-    enrollments: Vec<EnrollmentPackage>,
+    enrollments: Vec<BlsEnrollment>,
     issuer: TestIssuer,
+}
+
+struct BlsEnrollment {
+    participant: Participant,
+    secret_key: Vec<u8>,
+    proof_of_possession: Vec<u8>,
 }
 
 struct TestIssuer {
@@ -267,7 +323,8 @@ fn run_protocol_once(
     let finalize_ms = elapsed_ms(finalize_start.elapsed());
 
     let verify_start = Instant::now();
-    verify_embedded(&embedded, &prepared)?;
+    let export_content_hash = export_content_hash_from_stream("image/jpeg", SOURCE_JPEG)?;
+    verify_embedded(&embedded, &prepared, &export_content_hash)?;
     let verify_ms = elapsed_ms(verify_start.elapsed());
 
     Ok(Sample {
@@ -354,7 +411,7 @@ fn build_fixture(participants: usize) -> Result<BenchmarkFixture> {
         .map(|index| {
             let participant_id = format!("participant-{index:03}");
             let nonce = format!("fixture-nonce-{participants}-{index}");
-            make_enrollment_package(&participant_id, nonce.as_bytes())
+            make_bls_enrollment(&participant_id, nonce.as_bytes())
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -365,17 +422,44 @@ fn build_fixture(participants: usize) -> Result<BenchmarkFixture> {
 }
 
 fn prepare_enrollment(fixture: &BenchmarkFixture) -> Result<PreparedEnrollment> {
-    let signer = DemoCollectiveSigner;
-    let roster = c2pa::validate_enrollment_packages(&fixture.enrollments)?;
-    let aggregate_public_key = signer.aggregate_public_key(&roster)?;
-    let profile = build_aggregate_certificate_profile_from_enrollments(
-        aggregate_public_key,
-        &fixture.enrollments,
+    for enrollment in &fixture.enrollments {
+        verify_bls_proof_of_possession(enrollment)?;
+    }
+    let roster = canonicalize_roster(
+        &fixture
+            .enrollments
+            .iter()
+            .map(|enrollment| enrollment.participant.clone())
+            .collect::<Vec<_>>(),
     )?;
+    let signer = BlsCollectiveSigner {
+        secret_keys: fixture
+            .enrollments
+            .iter()
+            .map(|enrollment| {
+                (
+                    enrollment.participant.identifier.clone(),
+                    enrollment.secret_key.clone(),
+                )
+            })
+            .collect(),
+    };
+    let aggregate_public_key = signer.aggregate_public_key(&roster)?;
+    let profile = build_aggregate_certificate_profile(aggregate_public_key, &roster)?;
     let issued_certificate = issue_test_collaborative_certificate(&profile, &fixture.issuer)?;
 
     Ok(PreparedEnrollment {
         roster,
+        collective_signer: signer,
+        platform_private_key_pem: fixture
+            .issuer
+            .leaf_key
+            .private_key_to_pem_pkcs8()
+            .map_err(other_error)?,
+        platform_receipt_certificate: IssuedPlatformReceiptCertificate {
+            leaf_certificate_pem: issued_certificate.leaf_certificate_pem.clone(),
+            issuer_certificate_pem: issued_certificate.issuer_certificate_pem.clone(),
+        },
         issued_certificate,
         root_pem: fixture.issuer.root_pem.clone(),
     })
@@ -385,20 +469,47 @@ fn finalize_authorization(
     prepared: &PreparedEnrollment,
     run: usize,
 ) -> Result<EmbeddedCollaborativeManifest> {
-    let signer = DemoCollectiveSigner;
-    let claim_digest = ClaimDigest(
-        Sha256::digest(format!("collaborative-claim-digest-{run}").as_bytes()).to_vec(),
-    );
+    let signer = &prepared.collective_signer;
+    let session_id = format!("benchmark-session-{run}");
+    let final_state_hash =
+        Sha256::digest(format!("benchmark-final-state-{run}").as_bytes()).to_vec();
+    let export_content_hash = export_content_hash_from_stream("image/jpeg", SOURCE_JPEG)?;
+    let platform_acceptance_receipts = prepared
+        .roster
+        .iter()
+        .enumerate()
+        .map(|(index, participant)| {
+            issue_platform_acceptance_receipt(
+                &prepared.platform_private_key_pem,
+                &session_id,
+                participant,
+                format!("benchmark-accepted-action-{run}-{index}").as_bytes(),
+                index as u64,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let final_export_context_digest = build_receipt_bound_export_context_digest(
+        &session_id,
+        &final_state_hash,
+        &export_content_hash,
+        &prepared.roster,
+        &platform_acceptance_receipts,
+    )?;
     let partials = prepared
         .roster
         .iter()
-        .map(|participant| signer.partial_sign(participant, &claim_digest))
+        .map(|participant| signer.partial_sign(participant, &final_export_context_digest))
         .collect::<Result<Vec<_>>>()?;
     let aggregate_signature =
-        signer.aggregate_signatures(&claim_digest, &prepared.roster, &partials)?;
+        signer.aggregate_signatures(&final_export_context_digest, &prepared.roster, &partials)?;
 
     let authorization = AuthorizationPackage {
-        claim_digest,
+        session_id,
+        final_state_hash,
+        export_content_hash,
+        final_export_context_digest,
+        platform_acceptance_receipts,
+        platform_receipt_certificate: prepared.platform_receipt_certificate.clone(),
         aggregate_signature,
         aggregate_certificate_hash: hex::encode(Sha256::digest(serde_json::to_vec(
             &prepared.issued_certificate,
@@ -414,12 +525,17 @@ fn finalize_authorization(
 fn verify_embedded(
     embedded: &EmbeddedCollaborativeManifest,
     prepared: &PreparedEnrollment,
+    expected_export_content_hash: &[u8],
 ) -> Result<()> {
     let verifier = CollaborativeVerifier::with_trust_store(
-        DemoCollectiveSigner,
+        prepared.collective_signer.clone(),
         TrustStore::from_pem(prepared.root_pem.clone())?,
     );
-    black_box(verifier.verify_embedded(embedded, &prepared.roster)?);
+    black_box(verifier.verify_embedded(
+        embedded,
+        &prepared.roster,
+        expected_export_content_hash,
+    )?);
     Ok(())
 }
 
@@ -445,7 +561,8 @@ fn verify_signed_collaborative_jpeg(
         .ok_or_else(|| io_error(std::io::ErrorKind::InvalidData, "missing active manifest"))?;
     let embedded: EmbeddedCollaborativeManifest =
         active_manifest.find_assertion(COLLABORATIVE_AUTHORIZATION_LABEL)?;
-    verify_embedded(&embedded, prepared)
+    let export_content_hash = export_content_hash_from_stream("image/jpeg", signed_bytes)?;
+    verify_embedded(&embedded, prepared, &export_content_hash)
 }
 
 fn sign_standard_jpeg() -> Result<Vec<u8>> {
@@ -476,29 +593,51 @@ fn make_file_signer() -> CallbackSigner {
     CallbackSigner::new(ed_signer, SigningAlg::Ed25519, CERTS)
 }
 
-fn make_enrollment_package(participant_id: &str, nonce: &[u8]) -> Result<EnrollmentPackage> {
-    let private_key =
-        PKey::from_rsa(Rsa::generate(2048).map_err(other_error)?).map_err(other_error)?;
-    let public_key_der = private_key.public_key_to_der().map_err(other_error)?;
+fn make_bls_enrollment(participant_id: &str, nonce: &[u8]) -> Result<BlsEnrollment> {
+    let mut ikm = [0u8; 32];
+    OsRng.fill_bytes(&mut ikm);
+    let secret_key = bls::SecretKey::key_gen(&ikm, nonce).map_err(bls_error)?;
+    let public_key = secret_key.sk_to_pk();
+    let public_key_bytes = public_key.to_bytes().to_vec();
     let participant = Participant {
         identifier: participant_id.to_string(),
-        certificate_fingerprint: hex::encode(Sha256::digest(&public_key_der)),
-        public_key_der: public_key_der.clone(),
+        certificate_fingerprint: hex::encode(Sha256::digest(&public_key_bytes)),
+        public_key_der: public_key_bytes.clone(),
     };
-    let challenge = build_enrollment_challenge(participant_id, &public_key_der, nonce);
-    let mut signer =
-        OpenSslSigner::new(MessageDigest::sha256(), &private_key).map_err(other_error)?;
-    signer.update(&challenge).map_err(other_error)?;
-    let signature = signer.sign_to_vec().map_err(other_error)?;
-
-    Ok(EnrollmentPackage {
+    let proof_of_possession = secret_key.sign(&public_key_bytes, BLS_POP_DST, &[]);
+    Ok(BlsEnrollment {
         participant,
-        proof_of_possession: ProofOfPossession {
-            participant_id: participant_id.to_string(),
-            challenge,
-            signature,
-        },
+        secret_key: secret_key.to_bytes().to_vec(),
+        proof_of_possession: proof_of_possession.to_bytes().to_vec(),
     })
+}
+
+fn verify_bls_proof_of_possession(enrollment: &BlsEnrollment) -> Result<()> {
+    let public_key =
+        bls::PublicKey::from_bytes(&enrollment.participant.public_key_der).map_err(bls_error)?;
+    let proof = bls::Signature::from_bytes(&enrollment.proof_of_possession).map_err(bls_error)?;
+    if proof.verify(
+        true,
+        &enrollment.participant.public_key_der,
+        BLS_POP_DST,
+        &[],
+        &public_key,
+        true,
+    ) != BLST_ERROR::BLST_SUCCESS
+    {
+        return Err(io_error(
+            std::io::ErrorKind::PermissionDenied,
+            "BLS proof of possession verification failed",
+        ));
+    }
+    Ok(())
+}
+
+fn bls_error(error: BLST_ERROR) -> Error {
+    io_error(
+        std::io::ErrorKind::InvalidData,
+        format!("BLS12-381 operation failed: {error:?}"),
+    )
 }
 
 fn make_test_issuer() -> Result<TestIssuer> {

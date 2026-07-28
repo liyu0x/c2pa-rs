@@ -10,13 +10,13 @@
 //! while providing reusable data types and validation helpers for a
 //! jointly-authorized final state.
 
-use std::{collections::BTreeSet, fs, path::Path};
+use std::{collections::BTreeSet, fs, io::Cursor, path::Path};
 
 use openssl::{
     asn1::Asn1Time,
     hash::MessageDigest,
-    pkey::Id,
-    sign::Verifier,
+    pkey::{Id, PKey},
+    sign::{Signer, Verifier},
     x509::{store::X509StoreBuilder, verify::X509VerifyFlags, X509StoreContext, X509},
 };
 use serde::{Deserialize, Serialize};
@@ -62,9 +62,27 @@ pub struct EnrollmentPackage {
     pub proof_of_possession: ProofOfPossession,
 }
 
-/// A claim digest for the finalized C2PA state.
+/// A receipt issued by the platform after it accepts one participant action.
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-pub struct ClaimDigest(pub Vec<u8>);
+pub struct PlatformAcceptanceReceipt {
+    pub session_id: String,
+    pub participant_id: String,
+    pub participant_public_key_hash: String,
+    pub action_reference_hash: String,
+    pub sequence: u64,
+    pub signature: Vec<u8>,
+}
+
+/// The platform certificate used to verify acceptance receipts.
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct IssuedPlatformReceiptCertificate {
+    pub leaf_certificate_pem: String,
+    pub issuer_certificate_pem: String,
+}
+
+/// Digest of the receipt-bound export context signed by all listed clients.
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ExportContextDigest(pub Vec<u8>);
 
 /// A partial signature contributed by one participant.
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -73,7 +91,7 @@ pub struct PartialSignature {
     pub bytes: Vec<u8>,
 }
 
-/// A collective signature over one claim digest.
+/// A collective signature over one receipt-bound export-context digest.
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct AggregateSignature {
     pub algorithm: String,
@@ -105,7 +123,12 @@ pub struct IssuedAggregateCertificate {
 /// The embedded authorization object stored alongside the signed asset.
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct AuthorizationPackage {
-    pub claim_digest: ClaimDigest,
+    pub session_id: String,
+    pub final_state_hash: Vec<u8>,
+    pub export_content_hash: Vec<u8>,
+    pub final_export_context_digest: ExportContextDigest,
+    pub platform_acceptance_receipts: Vec<PlatformAcceptanceReceipt>,
+    pub platform_receipt_certificate: IssuedPlatformReceiptCertificate,
     pub aggregate_signature: AggregateSignature,
     pub aggregate_certificate_hash: String,
 }
@@ -149,19 +172,19 @@ pub trait CollectiveSigner {
     fn partial_sign(
         &self,
         participant: &Participant,
-        claim_digest: &ClaimDigest,
+        export_context_digest: &ExportContextDigest,
     ) -> Result<PartialSignature, Error>;
 
     fn aggregate_signatures(
         &self,
-        claim_digest: &ClaimDigest,
+        export_context_digest: &ExportContextDigest,
         roster: &[Participant],
         partials: &[PartialSignature],
     ) -> Result<AggregateSignature, Error>;
 
     fn verify(
         &self,
-        claim_digest: &ClaimDigest,
+        export_context_digest: &ExportContextDigest,
         aggregate_public_key: &AggregatePublicKey,
         signature: &AggregateSignature,
         roster: &[Participant],
@@ -223,6 +246,199 @@ pub fn encode_roster(roster: &[Participant]) -> Result<Vec<u8>, Error> {
         append_len_prefixed(&mut encoded, &encode_participant(&participant));
     }
     Ok(encoded)
+}
+
+fn platform_receipt_payload(receipt: &PlatformAcceptanceReceipt) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    append_len_prefixed(&mut encoded, b"C2PA-COLLAB-ACCEPTED-ACTION-V1");
+    append_len_prefixed(&mut encoded, receipt.session_id.as_bytes());
+    append_len_prefixed(&mut encoded, receipt.participant_id.as_bytes());
+    append_len_prefixed(&mut encoded, receipt.participant_public_key_hash.as_bytes());
+    append_len_prefixed(&mut encoded, receipt.action_reference_hash.as_bytes());
+    append_len_prefixed(&mut encoded, &receipt.sequence.to_be_bytes());
+    encoded
+}
+
+/// Sign a receipt after the platform has accepted the referenced action.
+pub fn issue_platform_acceptance_receipt(
+    platform_private_key_pem: &[u8],
+    session_id: impl Into<String>,
+    participant: &Participant,
+    action_reference: &[u8],
+    sequence: u64,
+) -> Result<PlatformAcceptanceReceipt, Error> {
+    let mut receipt = PlatformAcceptanceReceipt {
+        session_id: session_id.into(),
+        participant_id: participant.identifier.clone(),
+        participant_public_key_hash: hex::encode(Sha256::digest(&participant.public_key_der)),
+        action_reference_hash: hex::encode(Sha256::digest(action_reference)),
+        sequence,
+        signature: Vec::new(),
+    };
+    let private_key = PKey::private_key_from_pem(platform_private_key_pem).map_err(other_error)?;
+    let mut signer = Signer::new(MessageDigest::sha256(), &private_key).map_err(other_error)?;
+    signer
+        .update(&platform_receipt_payload(&receipt))
+        .map_err(other_error)?;
+    receipt.signature = signer.sign_to_vec().map_err(other_error)?;
+    Ok(receipt)
+}
+
+/// Verify one platform receipt, its participant binding, and its certificate chain.
+pub fn verify_platform_acceptance_receipt(
+    receipt: &PlatformAcceptanceReceipt,
+    participant: &Participant,
+    certificate: &IssuedPlatformReceiptCertificate,
+    trust_anchors_pem: &[String],
+    check_current_time: bool,
+) -> Result<(), Error> {
+    let expected_key_hash = hex::encode(Sha256::digest(&participant.public_key_der));
+    if receipt.participant_id != participant.identifier
+        || receipt.participant_public_key_hash != expected_key_hash
+    {
+        return Err(io_error(
+            std::io::ErrorKind::InvalidData,
+            "platform receipt is not bound to the expected participant and key",
+        ));
+    }
+
+    let certificate_for_chain = IssuedAggregateCertificate {
+        leaf_certificate_pem: certificate.leaf_certificate_pem.clone(),
+        issuer_certificate_pem: certificate.issuer_certificate_pem.clone(),
+    };
+    verify_certificate_chain(
+        &certificate_for_chain,
+        trust_anchors_pem,
+        check_current_time,
+    )?;
+
+    let leaf = X509::from_pem(certificate.leaf_certificate_pem.as_bytes()).map_err(other_error)?;
+    let public_key = leaf.public_key().map_err(other_error)?;
+    let mut verifier = Verifier::new(MessageDigest::sha256(), &public_key).map_err(other_error)?;
+    verifier
+        .update(&platform_receipt_payload(receipt))
+        .map_err(other_error)?;
+    if !verifier.verify(&receipt.signature).map_err(other_error)? {
+        return Err(io_error(
+            std::io::ErrorKind::PermissionDenied,
+            "platform acceptance receipt signature verification failed",
+        ));
+    }
+    Ok(())
+}
+
+fn canonicalize_platform_receipts(
+    receipts: &[PlatformAcceptanceReceipt],
+) -> Result<Vec<PlatformAcceptanceReceipt>, Error> {
+    if receipts.is_empty() {
+        return Err(io_error(
+            std::io::ErrorKind::InvalidInput,
+            "platform acceptance receipt set is empty",
+        ));
+    }
+    let mut canonical = receipts.to_vec();
+    canonical.sort_by(|left, right| left.participant_id.cmp(&right.participant_id));
+    for pair in canonical.windows(2) {
+        if pair[0].participant_id == pair[1].participant_id {
+            return Err(io_error(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "duplicate platform acceptance receipt for {}",
+                    pair[0].participant_id
+                ),
+            ));
+        }
+    }
+    Ok(canonical)
+}
+
+/// Verify exactly one platform receipt for every listed participant.
+pub fn verify_platform_acceptance_receipt_set(
+    session_id: &str,
+    receipts: &[PlatformAcceptanceReceipt],
+    roster: &[Participant],
+    certificate: &IssuedPlatformReceiptCertificate,
+    trust_anchors_pem: &[String],
+    check_current_time: bool,
+) -> Result<(), Error> {
+    let canonical_roster = canonicalize_roster(roster)?;
+    if canonical_roster.len() < 2 {
+        return Err(io_error(
+            std::io::ErrorKind::InvalidInput,
+            "collaborative receipt verification requires at least two participants",
+        ));
+    }
+    let canonical_receipts = canonicalize_platform_receipts(receipts)?;
+    if canonical_receipts.len() != canonical_roster.len() {
+        return Err(io_error(
+            std::io::ErrorKind::InvalidData,
+            "platform receipt set does not match the participant roster",
+        ));
+    }
+    for (receipt, participant) in canonical_receipts.iter().zip(canonical_roster.iter()) {
+        if receipt.session_id != session_id {
+            return Err(io_error(
+                std::io::ErrorKind::InvalidData,
+                "platform receipt belongs to a different collaborative session",
+            ));
+        }
+        verify_platform_acceptance_receipt(
+            receipt,
+            participant,
+            certificate,
+            trust_anchors_pem,
+            check_current_time,
+        )?;
+    }
+    Ok(())
+}
+
+/// Compute a deterministic commitment to the complete platform receipt set.
+pub fn platform_receipt_set_hash_hex(
+    receipts: &[PlatformAcceptanceReceipt],
+) -> Result<String, Error> {
+    let canonical = canonicalize_platform_receipts(receipts)?;
+    let mut encoded = Vec::new();
+    for receipt in canonical {
+        append_len_prefixed(&mut encoded, &platform_receipt_payload(&receipt));
+        append_len_prefixed(&mut encoded, &receipt.signature);
+    }
+    Ok(hex::encode(Sha256::digest(encoded)))
+}
+
+/// Build the digest signed by clients for a receipt-bound final export.
+pub fn build_receipt_bound_export_context_digest(
+    session_id: &str,
+    final_state_hash: &[u8],
+    export_content_hash: &[u8],
+    roster: &[Participant],
+    receipts: &[PlatformAcceptanceReceipt],
+) -> Result<ExportContextDigest, Error> {
+    let mut context = Vec::new();
+    append_len_prefixed(&mut context, b"C2PA-COLLAB-FINAL-EXPORT-V1");
+    append_len_prefixed(&mut context, session_id.as_bytes());
+    append_len_prefixed(&mut context, final_state_hash);
+    append_len_prefixed(&mut context, export_content_hash);
+    append_len_prefixed(&mut context, &encode_roster(roster)?);
+    append_len_prefixed(
+        &mut context,
+        platform_receipt_set_hash_hex(receipts)?.as_bytes(),
+    );
+    Ok(ExportContextDigest(Sha256::digest(context).to_vec()))
+}
+
+/// Compute a stable content commitment by removing any embedded C2PA manifest
+/// before hashing the remaining asset bytes.
+pub fn export_content_hash_from_stream(format: &str, asset_bytes: &[u8]) -> Result<Vec<u8>, Error> {
+    let handler = crate::jumbf_io::get_caiwriter_handler(format)
+        .ok_or_else(|| io_error(std::io::ErrorKind::InvalidInput, "unsupported asset format"))?;
+    let mut input = Cursor::new(asset_bytes);
+    let mut output = Cursor::new(Vec::new());
+    match handler.remove_cai_store_from_stream(&mut input, &mut output) {
+        Ok(()) => Ok(Sha256::digest(output.into_inner()).to_vec()),
+        Err(Error::JumbfNotFound) => Ok(Sha256::digest(asset_bytes).to_vec()),
+        Err(err) => Err(err),
+    }
 }
 
 /// Build the enrollment challenge that a participant must sign to prove
@@ -669,7 +885,14 @@ where
         &self,
         manifest: &EmbeddedCollaborativeManifest,
         roster: &[Participant],
+        expected_export_content_hash: &[u8],
     ) -> Result<VerificationSummary, Error> {
+        if manifest.authorization.export_content_hash != expected_export_content_hash {
+            return Err(io_error(
+                std::io::ErrorKind::InvalidData,
+                "collaborative material is bound to different exported content",
+            ));
+        }
         let expected_certificate_hash = hex::encode(Sha256::digest(serde_json::to_vec(
             &manifest.aggregate_certificate,
         )?));
@@ -697,6 +920,7 @@ where
             &manifest.authorization,
             roster,
             &aggregate_certificate,
+            expected_export_content_hash,
         )
     }
 
@@ -705,14 +929,42 @@ where
         package: &AuthorizationPackage,
         roster: &[Participant],
         aggregate_certificate: &AggregateCertificateProfile,
+        expected_export_content_hash: &[u8],
     ) -> Result<VerificationSummary, Error> {
+        if package.export_content_hash != expected_export_content_hash {
+            return Err(io_error(
+                std::io::ErrorKind::InvalidData,
+                "collaborative material is bound to different exported content",
+            ));
+        }
         self.policy.validate_algorithms(
             &package.aggregate_signature.algorithm,
             &aggregate_certificate.aggregate_public_key.algorithm,
         )?;
         validate_certificate_profile(&self.signer, aggregate_certificate, roster)?;
+        verify_platform_acceptance_receipt_set(
+            &package.session_id,
+            &package.platform_acceptance_receipts,
+            roster,
+            &package.platform_receipt_certificate,
+            self.trust_store.anchors(),
+            self.policy.check_current_time,
+        )?;
+        let expected_context = build_receipt_bound_export_context_digest(
+            &package.session_id,
+            &package.final_state_hash,
+            expected_export_content_hash,
+            roster,
+            &package.platform_acceptance_receipts,
+        )?;
+        if expected_context != package.final_export_context_digest {
+            return Err(io_error(
+                std::io::ErrorKind::InvalidData,
+                "receipt-bound final-export context digest mismatch",
+            ));
+        }
         self.signer.verify(
-            &package.claim_digest,
+            &package.final_export_context_digest,
             &aggregate_certificate.aggregate_public_key,
             &package.aggregate_signature,
             roster,
@@ -1080,12 +1332,16 @@ mod tests {
         fn partial_sign(
             &self,
             participant: &Participant,
-            claim_digest: &ClaimDigest,
+            export_context_digest: &ExportContextDigest,
         ) -> Result<PartialSignature, Error> {
             Ok(PartialSignature {
                 participant_id: participant.identifier.clone(),
                 bytes: Sha256::digest(
-                    [participant.public_key_der.as_slice(), &claim_digest.0].concat(),
+                    [
+                        participant.public_key_der.as_slice(),
+                        &export_context_digest.0,
+                    ]
+                    .concat(),
                 )
                 .to_vec(),
             })
@@ -1093,12 +1349,12 @@ mod tests {
 
         fn aggregate_signatures(
             &self,
-            claim_digest: &ClaimDigest,
+            export_context_digest: &ExportContextDigest,
             roster: &[Participant],
             partials: &[PartialSignature],
         ) -> Result<AggregateSignature, Error> {
             let canonical = canonicalize_roster(roster)?;
-            let mut material = claim_digest.0.clone();
+            let mut material = export_context_digest.0.clone();
             for participant in canonical {
                 let partial = partials
                     .iter()
@@ -1119,7 +1375,7 @@ mod tests {
 
         fn verify(
             &self,
-            claim_digest: &ClaimDigest,
+            export_context_digest: &ExportContextDigest,
             aggregate_public_key: &AggregatePublicKey,
             signature: &AggregateSignature,
             roster: &[Participant],
@@ -1133,9 +1389,10 @@ mod tests {
             }
             let partials = roster
                 .iter()
-                .map(|participant| self.partial_sign(participant, claim_digest))
+                .map(|participant| self.partial_sign(participant, export_context_digest))
                 .collect::<Result<Vec<_>, _>>()?;
-            let expected_sigma = self.aggregate_signatures(claim_digest, roster, &partials)?;
+            let expected_sigma =
+                self.aggregate_signatures(export_context_digest, roster, &partials)?;
             if expected_sigma != *signature {
                 return Err(Error::OtherError(Box::new(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -1329,7 +1586,7 @@ mod tests {
 
     fn issue_test_collaborative_certificate(
         profile: &AggregateCertificateProfile,
-    ) -> Result<(IssuedAggregateCertificate, String)> {
+    ) -> Result<(IssuedAggregateCertificate, String, Vec<u8>)> {
         let root_key =
             PKey::from_rsa(Rsa::generate(2048).map_err(other_error)?).map_err(other_error)?;
         let leaf_key =
@@ -1500,7 +1757,11 @@ mod tests {
             issuer_certificate_pem: pem_string(&root_cert)?,
         };
 
-        Ok((issued, pem_string(&root_cert)?))
+        Ok((
+            issued,
+            pem_string(&root_cert)?,
+            leaf_key.private_key_to_pem_pkcs8().map_err(other_error)?,
+        ))
     }
 
     fn issue_test_standard_certificate() -> Result<(IssuedAggregateCertificate, String)> {
@@ -1624,22 +1885,56 @@ mod tests {
         let enrollments = vec![alice, bob, carol];
         let roster = validate_enrollment_packages(&enrollments)?;
 
-        let claim_digest = ClaimDigest(Sha256::digest(b"collaborative claim digest").to_vec());
-        let partials = roster
-            .iter()
-            .map(|participant| signer.partial_sign(participant, &claim_digest))
-            .collect::<Result<Vec<_>>>()?;
-        let aggregate_signature = signer.aggregate_signatures(&claim_digest, &roster, &partials)?;
+        let session_id = "session-round-trip".to_string();
+        let source = include_bytes!("../tests/fixtures/IMG_0003.jpg");
+        let final_state_hash = Sha256::digest(b"collaborative final state").to_vec();
+        let export_content_hash = export_content_hash_from_stream("image/jpeg", source)?;
         let aggregate_public_key = signer.aggregate_public_key(&roster)?;
         let profile = build_aggregate_certificate_profile_from_enrollments(
             aggregate_public_key.clone(),
             &enrollments,
         )?;
-        let (issued_certificate, root_pem) = issue_test_collaborative_certificate(&profile)?;
+        let (issued_certificate, root_pem, platform_private_key_pem) =
+            issue_test_collaborative_certificate(&profile)?;
+        let platform_receipt_certificate = IssuedPlatformReceiptCertificate {
+            leaf_certificate_pem: issued_certificate.leaf_certificate_pem.clone(),
+            issuer_certificate_pem: issued_certificate.issuer_certificate_pem.clone(),
+        };
+        let platform_acceptance_receipts = roster
+            .iter()
+            .enumerate()
+            .map(|(index, participant)| {
+                issue_platform_acceptance_receipt(
+                    &platform_private_key_pem,
+                    &session_id,
+                    participant,
+                    format!("accepted-action-{index}").as_bytes(),
+                    index as u64,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let final_export_context_digest = build_receipt_bound_export_context_digest(
+            &session_id,
+            &final_state_hash,
+            &export_content_hash,
+            &roster,
+            &platform_acceptance_receipts,
+        )?;
+        let partials = roster
+            .iter()
+            .map(|participant| signer.partial_sign(participant, &final_export_context_digest))
+            .collect::<Result<Vec<_>>>()?;
+        let aggregate_signature =
+            signer.aggregate_signatures(&final_export_context_digest, &roster, &partials)?;
         let root_pem_for_trust = root_pem.clone();
         let root_pem_for_route = root_pem.clone();
         let authorization = AuthorizationPackage {
-            claim_digest: claim_digest.clone(),
+            session_id,
+            final_state_hash,
+            export_content_hash: export_content_hash.clone(),
+            final_export_context_digest,
+            platform_acceptance_receipts,
+            platform_receipt_certificate,
             aggregate_signature: aggregate_signature.clone(),
             aggregate_certificate_hash: hex::encode(Sha256::digest(
                 serde_json::to_vec(&issued_certificate).map_err(other_error)?,
@@ -1650,7 +1945,6 @@ mod tests {
             aggregate_certificate: issued_certificate,
         };
 
-        let source = include_bytes!("../tests/fixtures/IMG_0003.jpg");
         let mut source_stream = std::io::Cursor::new(source.as_slice());
         let mut output_stream = std::io::Cursor::new(Vec::<u8>::new());
 
@@ -1681,6 +1975,8 @@ mod tests {
         .map_err(other_error)?;
 
         patched_stream.set_position(0);
+        let presented_content_hash =
+            export_content_hash_from_stream("image/jpeg", patched_stream.get_ref())?;
         let reader = Reader::default().with_stream("image/jpeg", &mut patched_stream)?;
         assert!(reader.active_manifest().is_some());
 
@@ -1694,10 +1990,13 @@ mod tests {
             signer,
             TrustStore::from_pem(root_pem_for_trust)?,
         );
-        let summary = verifier.verify_embedded(&extracted, &roster)?;
+        let summary = verifier.verify_embedded(&extracted, &roster, &presented_content_hash)?;
         assert!(summary.verified);
         assert_eq!(summary.approver_ids, vec!["alice", "bob", "carol"]);
         assert_eq!(summary.aggregate_algorithm, aggregate_signature.algorithm);
+        assert!(verifier
+            .verify_embedded(&extracted, &roster, &Sha256::digest(b"other asset"))
+            .is_err());
 
         let route = verify_issued_certificate_by_route(
             &signer,
@@ -1727,22 +2026,56 @@ mod tests {
         let enrollments = vec![alice, bob, carol, dave, eve];
         let roster = validate_enrollment_packages(&enrollments)?;
 
-        let claim_digest = ClaimDigest(Sha256::digest(b"collaborative claim digest five").to_vec());
-        let partials = roster
-            .iter()
-            .map(|participant| signer.partial_sign(participant, &claim_digest))
-            .collect::<Result<Vec<_>>>()?;
-        let aggregate_signature = signer.aggregate_signatures(&claim_digest, &roster, &partials)?;
+        let session_id = "session-five-participants".to_string();
+        let source = include_bytes!("../tests/fixtures/IMG_0003.jpg");
+        let final_state_hash = Sha256::digest(b"collaborative final state five").to_vec();
+        let export_content_hash = export_content_hash_from_stream("image/jpeg", source)?;
         let aggregate_public_key = signer.aggregate_public_key(&roster)?;
         let profile = build_aggregate_certificate_profile_from_enrollments(
             aggregate_public_key.clone(),
             &enrollments,
         )?;
-        let (issued_certificate, root_pem) = issue_test_collaborative_certificate(&profile)?;
+        let (issued_certificate, root_pem, platform_private_key_pem) =
+            issue_test_collaborative_certificate(&profile)?;
+        let platform_receipt_certificate = IssuedPlatformReceiptCertificate {
+            leaf_certificate_pem: issued_certificate.leaf_certificate_pem.clone(),
+            issuer_certificate_pem: issued_certificate.issuer_certificate_pem.clone(),
+        };
+        let platform_acceptance_receipts = roster
+            .iter()
+            .enumerate()
+            .map(|(index, participant)| {
+                issue_platform_acceptance_receipt(
+                    &platform_private_key_pem,
+                    &session_id,
+                    participant,
+                    format!("accepted-action-five-{index}").as_bytes(),
+                    index as u64,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let final_export_context_digest = build_receipt_bound_export_context_digest(
+            &session_id,
+            &final_state_hash,
+            &export_content_hash,
+            &roster,
+            &platform_acceptance_receipts,
+        )?;
+        let partials = roster
+            .iter()
+            .map(|participant| signer.partial_sign(participant, &final_export_context_digest))
+            .collect::<Result<Vec<_>>>()?;
+        let aggregate_signature =
+            signer.aggregate_signatures(&final_export_context_digest, &roster, &partials)?;
         let root_pem_for_trust = root_pem.clone();
         let root_pem_for_route = root_pem.clone();
         let authorization = AuthorizationPackage {
-            claim_digest: claim_digest.clone(),
+            session_id,
+            final_state_hash,
+            export_content_hash: export_content_hash.clone(),
+            final_export_context_digest,
+            platform_acceptance_receipts,
+            platform_receipt_certificate,
             aggregate_signature: aggregate_signature.clone(),
             aggregate_certificate_hash: hex::encode(Sha256::digest(
                 serde_json::to_vec(&issued_certificate).map_err(other_error)?,
@@ -1753,7 +2086,6 @@ mod tests {
             aggregate_certificate: issued_certificate,
         };
 
-        let source = include_bytes!("../tests/fixtures/IMG_0003.jpg");
         let mut source_stream = std::io::Cursor::new(source.as_slice());
         let mut output_stream = std::io::Cursor::new(Vec::<u8>::new());
 
@@ -1784,6 +2116,8 @@ mod tests {
         .map_err(other_error)?;
 
         patched_stream.set_position(0);
+        let presented_content_hash =
+            export_content_hash_from_stream("image/jpeg", patched_stream.get_ref())?;
         let reader = Reader::default().with_stream("image/jpeg", &mut patched_stream)?;
         let extracted = reader
             .active_manifest()
@@ -1794,7 +2128,7 @@ mod tests {
             signer,
             TrustStore::from_pem(root_pem_for_trust)?,
         );
-        let summary = verifier.verify_embedded(&extracted, &roster)?;
+        let summary = verifier.verify_embedded(&extracted, &roster, &presented_content_hash)?;
         assert!(summary.verified);
         assert_eq!(
             summary.approver_ids,
@@ -1809,6 +2143,84 @@ mod tests {
             true,
         )?;
         assert_eq!(route, CertificateVerificationRoute::Collaborative);
+
+        Ok(())
+    }
+
+    #[test]
+    fn platform_acceptance_receipts_reject_tampering_and_wrong_session() -> Result<()> {
+        let signer = DummySigner;
+        let (_, alice) = make_enrollment_package("alice", b"nonce-alice-receipt")?;
+        let (_, bob) = make_enrollment_package("bob", b"nonce-bob-receipt")?;
+        let enrollments = vec![alice, bob];
+        let roster = validate_enrollment_packages(&enrollments)?;
+        let profile = build_aggregate_certificate_profile_from_enrollments(
+            signer.aggregate_public_key(&roster)?,
+            &enrollments,
+        )?;
+        let (issued, root_pem, platform_private_key_pem) =
+            issue_test_collaborative_certificate(&profile)?;
+        let platform_certificate = IssuedPlatformReceiptCertificate {
+            leaf_certificate_pem: issued.leaf_certificate_pem,
+            issuer_certificate_pem: issued.issuer_certificate_pem,
+        };
+        let receipts = roster
+            .iter()
+            .enumerate()
+            .map(|(index, participant)| {
+                issue_platform_acceptance_receipt(
+                    &platform_private_key_pem,
+                    "session-receipt-test",
+                    participant,
+                    format!("accepted-action-receipt-{index}").as_bytes(),
+                    index as u64,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let trust_anchors = vec![root_pem];
+
+        verify_platform_acceptance_receipt_set(
+            "session-receipt-test",
+            &receipts,
+            &roster,
+            &platform_certificate,
+            &trust_anchors,
+            true,
+        )?;
+
+        assert!(verify_platform_acceptance_receipt_set(
+            "another-session",
+            &receipts,
+            &roster,
+            &platform_certificate,
+            &trust_anchors,
+            true,
+        )
+        .is_err());
+
+        let mut tampered_action = receipts.clone();
+        tampered_action[0].action_reference_hash = hex::encode(Sha256::digest(b"forged-action"));
+        assert!(verify_platform_acceptance_receipt_set(
+            "session-receipt-test",
+            &tampered_action,
+            &roster,
+            &platform_certificate,
+            &trust_anchors,
+            true,
+        )
+        .is_err());
+
+        let mut tampered_participant = receipts;
+        tampered_participant[0].participant_id = "mallory".to_string();
+        assert!(verify_platform_acceptance_receipt_set(
+            "session-receipt-test",
+            &tampered_participant,
+            &roster,
+            &platform_certificate,
+            &trust_anchors,
+            true,
+        )
+        .is_err());
 
         Ok(())
     }

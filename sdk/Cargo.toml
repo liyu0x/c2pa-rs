@@ -290,6 +290,7 @@ web-sys = { version = "0.3.58", features = [
 
 [dev-dependencies]
 anyhow = "1.0.97"
+blst = "0.3.16"
 glob = "0.3.1"
 hex-literal = "1.0.0"
 jumbf = "0.7.0"
